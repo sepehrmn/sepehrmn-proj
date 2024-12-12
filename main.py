@@ -3,6 +3,9 @@ from weaviate.classes.init import Auth
 import os
 import nltk
 from nltk.tokenize import sent_tokenize
+import time
+from tenacity import retry, stop_after_attempt, wait_exponential
+from weaviate.classes.config import Configure, Property
 
 # Download all necessary NLTK data
 try:
@@ -11,12 +14,6 @@ try:
 except LookupError:
     nltk.download('punkt', quiet=True)
     nltk.download('punkt_tab', quiet=True)
-
-
-# Example environment variables setup:
-# export WEAVIATE_URL="https://your-cluster.weaviate.network"
-# export WEAVIATE_API_KEY="your-api-key"
-# export MISTRAL_API_KEY="your-mistral-key"
 
 weaviate_url = os.environ.get("WEAVIATE_URL")
 weaviate_key = os.environ.get("WEAVIATE_API_KEY")
@@ -32,7 +29,7 @@ client = weaviate.connect_to_weaviate_cloud(
     headers=headers
 )
 
-from weaviate.classes.config import Configure
+
 
 # Check if collection exists, create only if it doesn't
 collection_name = "DemoCollection"
@@ -41,19 +38,26 @@ try:
     print(f"Collection {collection_name} already exists")
 except:
     print(f"Creating collection {collection_name}")
-    # Example: Creating collection with custom configuration
-    # You can modify vectorizer and generative configs:
-    # - Change model: Configure.Generative.mistral(model="mistral-large-latest")
-    # - Add more properties: source_properties=["title", "content", "custom_field"]
     client.collections.create(
         collection_name,
-        vectorizer_config=[
-            Configure.NamedVectors.text2vec_mistral(
-                name="title_vector",
-                source_properties=["title", "content"],
-            )
-        ],
-        generative_config=Configure.Generative.mistral()
+        vectorizer_config=Configure.Vectorizer.text2vec_mistral(),
+        generative_config=Configure.Generative.mistral(
+            model="mistral-medium"
+        ),
+        properties=[
+            {
+                "name": "title",
+                "dataType": ["text"]
+            },
+            {
+                "name": "content",
+                "dataType": ["text"]
+            },
+            {
+                "name": "chunk_id",
+                "dataType": ["text"]
+            }
+        ]
     )
 
 def chunk_text(text, chunk_size=5):
@@ -128,38 +132,37 @@ try:
             # Get the collection reference
             collection = client.collections.get(collection_name)
             
-            # Update the query syntax
+            # First get relevant documents using near_text
             response = collection.query.near_text(
                 query=query,
                 limit=limit,
                 return_properties=["title", "content", "chunk_id"]
             )
 
-            # Check if we got any results
             if not response.objects:
                 return {
                     "generated_answer": "No relevant documents found.",
                     "retrieved_chunks": []
                 }
 
+            # Prepare the context from retrieved chunks
             context = " ".join([obj.properties["content"] for obj in response.objects])
             
+            # Generate answer using the context
             generate_prompt = f"""Based on the following context, answer the question.
             Context: {context}
             
             Question: {query}
             
             Answer:"""
-
-            # Update the generate syntax and properly access the response
+            
             generated_response = collection.generate.near_text(
                 query=query,
                 prompt=generate_prompt
             )
 
-            # The generated text is now accessed through the generation property
             return {
-                "generated_answer": generated_response.generated_text,  # Changed from .generated to .generated_text
+                "generated_answer": generated_response.generated,
                 "retrieved_chunks": [
                     {
                         "title": obj.properties["title"],
@@ -170,7 +173,7 @@ try:
                 ]
             }
         except Exception as e:
-            print(f"Query error: {str(e)}")  # Add more detailed error logging
+            print(f"Query error: {str(e)}")
             return {"error": str(e)}
 
     # Example queries
@@ -187,12 +190,14 @@ try:
         
         if "error" in result:
             print(f"Error: {result['error']}")
-            continue
+        else:
+            print("Generated Answer:", result["generated_answer"])
+            print("\nRetrieved Chunks:")
+            for chunk in result["retrieved_chunks"]:
+                print(f"- {chunk['title']}: {chunk['content'][:100]}...")
         
-        print("Generated Answer:", result["generated_answer"])
-        print("\nRetrieved Chunks:")
-        for chunk in result["retrieved_chunks"]:
-            print(f"- {chunk['title']}: {chunk['content'][:100]}...")
+        # Increase delay between queries
+        time.sleep(5)  # Increased from 2 to 5 seconds
 
 except Exception as e:
     print(f"Error: {str(e)}")
